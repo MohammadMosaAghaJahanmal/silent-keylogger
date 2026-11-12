@@ -1,0 +1,9 @@
+.tools/
+build/
+dist/
+__pycache__/
+server/node_modules/
+server/database.sqlite*
+server/uploads/*
+!server/uploads/.gitkeep
+server/.test-*/

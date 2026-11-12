@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PDF · Admin</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/admin.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><div><p class="eyebrow">PDF / LOCAL SERVER</p><h1>Files</h1></div><a href="/">Download page ↗</a></header>
+    <section aria-labelledby="setup-heading">
+      <h2 id="setup-heading">Application setup</h2>
+      <p id="setup-info">Loading setup…</p>
+      <form id="setup-form">
+        <label for="setup-file">PDF-Setup.exe <span class="muted">· maximum 64 MiB</span></label>
+        <div class="form-row"><input id="setup-file" name="file" type="file" accept=".exe" required><button id="setup-submit" type="submit">Upload setup</button></div>
+      </form>
+    </section>
+    <section aria-labelledby="uploads-heading">
+      <div class="section-heading"><h2 id="uploads-heading">Received count files</h2><button id="refresh" class="secondary" type="button">Refresh</button></div>
+      <p class="muted">Newest first. All dates are UTC.</p>
+      <div class="table-scroll"><table>
+        <thead><tr><th scope="col">ID</th><th scope="col">Filename</th><th scope="col">Device</th><th scope="col">File size</th><th scope="col">Received (UTC)</th><th scope="col">Actions</th></tr></thead>
+        <tbody id="uploads"><tr><td colspan="6">Loading files…</td></tr></tbody>
+      </table></div>
+    </section>
+    <p id="status" role="status" aria-live="polite"></p>
+  </main>
+</body>
+</html>
