@@ -16,6 +16,11 @@ class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
+function logIncomingRequest(req) {
+  const requestPath = req.url.split('?', 1)[0];
+  console.log(`Request coming in via ${req.method} ${requestPath}`);
+}
+
 // A separate directory under server/ is allowed for isolated integration tests.
 function createApp({ dataDir = ROOT, log = console.error } = {}) {
   dataDir = path.resolve(dataDir);
@@ -54,6 +59,10 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
 
   const app = express();
   app.disable('x-powered-by');
+  app.use((req, _res, next) => {
+    logIncomingRequest(req);
+    next();
+  });
   app.use((req, res, next) => {
     res.set({
       'X-Content-Type-Options': 'nosniff',
@@ -80,6 +89,7 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
     filename: (_req, _file, callback) => callback(null, randomUUID() + '.pending')
   });
   function receiver(kind) {
+    console.log(`Receiver for ${kind} uploads is ready.`);
     return multer({
       storage, preservePath: true,
       limits: { fileSize: kind === 'text' ? TEXT_LIMIT : SETUP_LIMIT,
@@ -188,6 +198,7 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
     return result;
   }
   function saveUpload(kind) {
+    console.log(`Save handler for ${kind} uploads is ready.`);
     return async (req, res, next) => {
       let newFile;
       let saved = false;
@@ -334,6 +345,11 @@ if (require.main === module) {
     const service = createApp();
     const server = service.app.listen(8000, '127.0.0.1', () => {
       console.log('PDF server: http://127.0.0.1:8000/  Admin: http://127.0.0.1:8000/admin');
+    });
+    // Node handles CONNECT outside the Express request pipeline.
+    server.on('connect', (req, socket) => {
+      logIncomingRequest(req);
+      socket.destroy();
     });
     server.on('error', error => { console.error('Server startup failed:', error.message); service.close(); process.exitCode = 1; });
     for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => {
