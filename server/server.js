@@ -1,32 +1,84 @@
 'use strict';
-
 const express = require('express');
 const multer = require('multer');
 const fs = require('node:fs');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
-const { TextDecoder } = require('node:util');
+const { randomUUID, timingSafeEqual } = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
-
 const ROOT = __dirname;
-const TEXT_LIMIT = 5 * 1024 * 1024;
-const SETUP_LIMIT = 64 * 1024 * 1024;
+const PUBLIC_DIR = path.join(ROOT, 'public');
 
+// Works locally by default; works behind cPanel/Passenger when PORT is assigned.
+const HOSTED = Boolean(process.env.PORT || process.env.NODE_ENV === 'production' ||
+  process.env.PASSENGER_APP_ENV);
+
+function getListenHost() {
+  return process.env.HOST || (HOSTED ? '0.0.0.0' : '127.0.0.1');
+}
+
+function getListenPort() {
+  const port = Number(process.env.PORT || 8000);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error('PORT must be a valid port number (0-65535).');
+  }
+  return port;
+}
+
+function equalSecrets(supplied, expected) {
+  if (typeof supplied !== 'string' || !supplied || !expected) return false;
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function requireToken(token) {
+  return (req, _res, next) => {
+    if (!token) return next();
+    const authorization = req.headers.authorization || '';
+    const bearer = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+    if (!equalSecrets(req.get('x-api-key'), token) && !equalSecrets(bearer, token)) {
+      return next(new HttpError(401, 'A valid API token is required.'));
+    }
+    next();
+  };
+}
+
+function requestHostname(value) {
+  if (typeof value !== 'string' || !value || /[\\\s/]/.test(value)) {
+    throw new HttpError(400, 'Invalid Host header.');
+  }
+  try {
+    const url = new URL('http://' + value);
+    return { hostname: url.hostname.replace(/^\[|\]$/g, '').toLowerCase(), host: url.host.toLowerCase() };
+  } catch {
+    throw new HttpError(400, 'Invalid Host header.');
+  }
+}
+
+function fallbackPage(res, name, fallback) {
+  const file = path.join(PUBLIC_DIR, name);
+  if (fs.existsSync(file)) return res.sendFile(file);
+  return res.type('html').send(fallback);
+}
+// Upload any file type, provided it is strictly smaller than 10 MiB.
+const UPLOAD_LIMIT = 10 * 1024 * 1024;
+// Keep the old exported names for existing clients/tests.
+const TEXT_LIMIT = UPLOAD_LIMIT;
+const SETUP_LIMIT = UPLOAD_LIMIT;
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
-
 function logIncomingRequest(req) {
   const requestPath = req.url.split('?', 1)[0];
   console.log(`Request coming in via ${req.method} ${requestPath}`);
 }
-
-// A separate directory under server/ is allowed for isolated integration tests.
-function createApp({ dataDir = ROOT, log = console.error } = {}) {
+// DATA_DIR can override the default so hosted deployments can use private storage.
+function createApp({
+  dataDir = process.env.DATA_DIR || ROOT,
+  log = console.error,
+  localOnly = getListenHost() === '127.0.0.1' || getListenHost() === 'localhost'
+} = {}) {
   dataDir = path.resolve(dataDir);
-  if (dataDir !== ROOT && !dataDir.startsWith(ROOT + path.sep)) {
-    throw new Error('Data directory must be inside server/.');
-  }
   fs.mkdirSync(dataDir, { recursive: true });
   const uploadDir = path.join(dataDir, 'uploads');
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -43,7 +95,7 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
       CREATE TABLE IF NOT EXISTS appsetup (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         original_name TEXT NOT NULL, stored_name TEXT NOT NULL UNIQUE,
-        file_path TEXT NOT NULL, file_size INTEGER NOT NULL CHECK(file_size > 0),
+        file_path TEXT NOT NULL, file_size INTEGER NOT NULL CHECK(file_size >= 0),
         received_at TEXT NOT NULL
       );`);
     // Add nullable columns without rewriting existing files, rows or IDs.
@@ -53,10 +105,24 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
       for (const column of ['device_id', 'device_name', 'os_version']) {
         if (!columns.has(column)) db.exec(`ALTER TABLE uploads ADD COLUMN ${column} TEXT`);
       }
+      // Older installations have a > 0 constraint for appsetup files.
+      // Migrate it so a zero-byte file is also permitted, without losing data.
+      const setupSql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='appsetup'").get()?.sql || '';
+      if (/CHECK\s*\(\s*file_size\s*>\s*0\s*\)/i.test(setupSql)) {
+        db.exec(`CREATE TABLE appsetup_new (
+          id INTEGER PRIMARY KEY CHECK(id = 1),
+          original_name TEXT NOT NULL, stored_name TEXT NOT NULL UNIQUE,
+          file_path TEXT NOT NULL, file_size INTEGER NOT NULL CHECK(file_size >= 0),
+          received_at TEXT NOT NULL
+        );
+        INSERT INTO appsetup_new (id,original_name,stored_name,file_path,file_size,received_at)
+          SELECT id,original_name,stored_name,file_path,file_size,received_at FROM appsetup;
+        DROP TABLE appsetup;
+        ALTER TABLE appsetup_new RENAME TO appsetup;`);
+      }
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   } catch (error) { db.close(); throw error; }
-
   const app = express();
   app.disable('x-powered-by');
   app.use((req, _res, next) => {
@@ -70,20 +136,40 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
       'Cache-Control': 'no-store',
       'Referrer-Policy': 'no-referrer'
     });
-    // Bind to loopback and reject DNS rebinding and cross-site browser writes.
-    const host = req.headers.host || '';
-    if (!/^(127\.0\.0\.1|localhost):\d+$/.test(host)) {
+    // Local access stays restricted; deployed hosts may use any domain unless
+    // ALLOWED_HOSTS is configured. No hardcoded localhost restriction on cPanel.
+    let requestHost;
+    try { requestHost = requestHostname(req.headers.host); }
+    catch (error) { return next(error); }
+    if (localOnly && !['localhost', '127.0.0.1', '::1'].includes(requestHost.hostname)) {
       return next(new HttpError(403, 'Use the local server address.'));
     }
+    const allowedHosts = (process.env.ALLOWED_HOSTS || '').split(',')
+      .map(value => value.trim().toLowerCase()).filter(Boolean);
+    if (allowedHosts.length && !allowedHosts.includes(requestHost.hostname)) {
+      return next(new HttpError(403, 'Host is not allowed.'));
+    }
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
-      const origin = req.headers.origin;
-      if ((origin && origin !== `http://${host}`) || req.headers['sec-fetch-site'] === 'cross-site') {
+      if (req.headers['sec-fetch-site'] === 'cross-site') {
         return next(new HttpError(403, 'Cross-site changes are not allowed.'));
+      }
+      const origin = req.headers.origin;
+      if (origin) {
+        try {
+          const parsedOrigin = new URL(origin);
+          const publicOrigin = process.env.PUBLIC_ORIGIN;
+          const permitted = publicOrigin
+            ? parsedOrigin.origin === new URL(publicOrigin).origin
+            : ['http:', 'https:'].includes(parsedOrigin.protocol) &&
+              parsedOrigin.host.toLowerCase() === requestHost.host;
+          if (!permitted) return next(new HttpError(403, 'Cross-site changes are not allowed.'));
+        } catch {
+          return next(new HttpError(403, 'Invalid request Origin.'));
+        }
       }
     }
     next();
   });
-
   const storage = multer.diskStorage({
     destination: uploadDir,
     filename: (_req, _file, callback) => callback(null, randomUUID() + '.pending')
@@ -91,30 +177,24 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
   function receiver(kind) {
     console.log(`Receiver for ${kind} uploads is ready.`);
     return multer({
-      storage, preservePath: true,
-      limits: { fileSize: kind === 'text' ? TEXT_LIMIT : SETUP_LIMIT,
-        files: 1, fields: kind === 'text' ? 3 : 0, parts: kind === 'text' ? 4 : 1,
-        fieldSize: 1024, fieldNameSize: 100, headerPairs: 32 },
-      fileFilter(_req, file, callback) {
-        const name = file.originalname;
-        // Never derive a filesystem path from an incoming filename.
-        if (!name || name.length > 200 || /[\\/:\x00-\x1f\x7f]/.test(name) || name !== path.basename(name)) {
-          return callback(new HttpError(400, 'Invalid filename.'));
-        }
-        if (kind === 'text' ? !/\.txt$/i.test(name) : !/^PDF-Setup\.exe$/i.test(name)) {
-          return callback(new HttpError(415, kind === 'text'
-            ? 'Upload a UTF-8 .txt file.' : 'Upload PDF-Setup.exe.'));
-        }
-        callback(null, true);
+      storage,
+      // Only a size limit: no extension, MIME type, filename or content checks.
+      limits: {
+        fileSize: UPLOAD_LIMIT,
+        files: 1,
+        fields: kind === 'text' ? 3 : 0,
+        parts: kind === 'text' ? 4 : 1,
+        fieldSize: 1024,
+        fieldNameSize: 100,
+        headerPairs: 32
       }
     }).single('file');
   }
-
   function remove(file) {
     try { fs.unlinkSync(file); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
   function safePath(row, extension) {
-    if (!row || !new RegExp(`^[a-f0-9-]{36}\\.${extension}$`).test(row.stored_name)
+    if (!row || !new RegExp(`^[a-f0-9-]{36}\\.(?:${extension}|upload)$`).test(row.stored_name)
         || row.file_path !== `uploads/${row.stored_name}`) {
       throw new HttpError(500, 'Invalid stored file record.');
     }
@@ -129,38 +209,6 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
     }
     if (!stat.isFile() || stat.isSymbolicLink()) throw new HttpError(404, 'File is no longer available.');
     return file;
-  }
-  async function validateText(file) {
-    const decoder = new TextDecoder('utf-8', { fatal: true });
-    try {
-      for await (const chunk of fs.createReadStream(file)) {
-        const text = decoder.decode(chunk, { stream: true });
-        if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text)) {
-          throw new HttpError(415, 'File contains binary control characters.');
-        }
-      }
-      decoder.decode();
-    } catch (error) {
-      if (error instanceof TypeError) throw new HttpError(415, 'File must contain valid UTF-8 text.');
-      throw error;
-    }
-  }
-  function validateSetup(file) {
-    const fd = fs.openSync(file, 'r');
-    try {
-      const header = Buffer.alloc(64);
-      const length = fs.fstatSync(fd).size;
-      if (fs.readSync(fd, header, 0, 64, 0) !== 64 || header.toString('ascii', 0, 2) !== 'MZ') {
-        throw new HttpError(415, 'Setup must be a Windows executable.');
-      }
-      const offset = header.readUInt32LE(60);
-      const pe = Buffer.alloc(24);
-      if (offset < 64 || offset > length - 24 || fs.readSync(fd, pe, 0, 24, offset) !== 24
-          || pe.readUInt32LE(0) !== 0x4550 || !(pe.readUInt16LE(22) & 2)
-          || (pe.readUInt16LE(22) & 0x2000)) {
-        throw new HttpError(415, 'Setup must be a Windows executable.');
-      }
-    } finally { fs.closeSync(fd); }
   }
   function syncFile(file) {
     const fd = fs.openSync(file, 'r+');
@@ -205,10 +253,12 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
       try {
         if (!req.file) throw new HttpError(400, 'Provide one file using the field named file.');
         const device = kind === 'text' ? deviceMetadata(req.body) : null;
-        if (kind === 'text') await validateText(req.file.path);
-        else validateSetup(req.file.path);
+        // Multer allows up to the limit; the application requires strictly LESS than 10 MiB.
+        if (req.file.size >= UPLOAD_LIMIT) {
+          throw new HttpError(413, 'File must be smaller than 10 MB.');
+        }
         syncFile(req.file.path);
-        const stored = randomUUID() + (kind === 'text' ? '.txt' : '.exe');
+        const stored = randomUUID() + '.upload';
         newFile = path.join(uploadDir, stored);
         const row = { original_name: req.file.originalname, stored_name: stored,
           file_path: `uploads/${stored}`, file_size: req.file.size, received_at: new Date().toISOString() };
@@ -238,29 +288,36 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
         res.status(201).json({ success: true, upload: metadata(row) });
       } catch (error) { next(error); }
       finally {
-        // Failed validation/DB writes must not leave an accepted-looking upload.
+        // Failed size checks/DB writes must not leave an accepted-looking upload.
         for (const file of [req.file?.path, !saved && newFile].filter(Boolean)) {
           try { remove(file); } catch (error) { log('Upload cleanup:', error.message); }
         }
       }
     };
   }
-  app.post('/create', receiver('text'), saveUpload('text'));
-  app.post('/api/appsetup', receiver('setup'), saveUpload('setup'));
+  // Optional separate keys make a public deployment safer without changing
+  // existing local clients. Set environment variables for hosted deployment.
+  const adminAuth = requireToken(process.env.ADMIN_TOKEN);
+  const uploadAuth = requireToken(process.env.UPLOAD_TOKEN);
+  app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+  app.post('/create', uploadAuth, receiver('text'), saveUpload('text'));
+  app.post('/api/appsetup', adminAuth, receiver('setup'), saveUpload('setup'));
   app.get('/api/appsetup', (_req, res) => res.json(metadata(db.prepare('SELECT * FROM appsetup WHERE id=1').get())));
-  app.get('/api/uploads', (_req, res) => {
+  app.get('/api/uploads', adminAuth, (_req, res) => {
     res.json(db.prepare(`SELECT id,original_name,file_size,received_at,device_id,device_name,os_version
       FROM uploads ORDER BY id DESC`).all());
   });
-
   app.get('/', (_req, res, next) => {
     try {
       const row = db.prepare('SELECT * FROM appsetup WHERE id=1').get();
       if (row) {
-        try { existing(row, 'exe'); } catch (error) { if (error.status !== 404) throw error; return res.sendFile(path.join(ROOT, 'public', 'empty.html')); }
-        return res.sendFile(path.join(ROOT, 'public', 'index.html'));
+        try { existing(row, 'exe'); } catch (error) {
+          if (error.status !== 404) throw error;
+          return fallbackPage(res, 'empty.html', '<h2>No setup file uploaded yet.</h2>');
+        }
+        return fallbackPage(res, 'index.html', '<h2>Setup is available</h2><p><a href="/download/app">Download setup</a></p>');
       }
-      res.sendFile(path.join(ROOT, 'public', 'empty.html'));
+      fallbackPage(res, 'empty.html', '<h2>No setup file uploaded yet.</h2>');
     } catch (error) { next(error); }
   });
   app.get('/download/app', (_req, res, next) => {
@@ -268,7 +325,7 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
       const row = db.prepare('SELECT * FROM appsetup WHERE id=1').get();
       if (!row) throw new HttpError(404, 'No file available.');
       const file = existing(row, 'exe');
-      res.download(path.basename(file), 'PDF-Setup.exe', { root: uploadDir, headers: { 'Content-Type': 'application/octet-stream' } }, error => { if (error) next(error); });
+      res.download(path.basename(file), row.original_name, { root: uploadDir, headers: { 'Content-Type': 'application/octet-stream' } }, error => { if (error) next(error); });
     } catch (error) { next(error); }
   });
   function countRow(req) {
@@ -279,21 +336,24 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
     if (!row) throw new HttpError(404, 'Upload not found.');
     return row;
   }
-  app.get('/api/uploads/:id/open', (req, res, next) => {
-    try {
-      const file = existing(countRow(req), 'txt');
-      res.set({ 'Content-Type': 'text/plain; charset=utf-8', 'Content-Security-Policy': "sandbox; default-src 'none'" });
-      res.sendFile(path.basename(file), { root: uploadDir }, error => { if (error) next(error); });
-    } catch (error) { next(error); }
-  });
-  app.get('/api/uploads/:id/download', (req, res, next) => {
+  app.get('/api/uploads/:id/open', adminAuth, (req, res, next) => {
     try {
       const row = countRow(req);
       const file = existing(row, 'txt');
-      res.download(path.basename(file), row.original_name, { root: uploadDir, headers: { 'Content-Type': 'text/plain; charset=utf-8' } }, error => { if (error) next(error); });
+      res.set('Content-Security-Policy', "sandbox; default-src 'none'");
+      res.download(path.basename(file), row.original_name,
+        { root: uploadDir, headers: { 'Content-Type': 'application/octet-stream' } },
+        error => { if (error) next(error); });
     } catch (error) { next(error); }
   });
-  app.delete('/api/uploads/:id', (req, res, next) => {
+  app.get('/api/uploads/:id/download', adminAuth, (req, res, next) => {
+    try {
+      const row = countRow(req);
+      const file = existing(row, 'txt');
+      res.download(path.basename(file), row.original_name, { root: uploadDir, headers: { 'Content-Type': 'application/octet-stream' } }, error => { if (error) next(error); });
+    } catch (error) { next(error); }
+  });
+  app.delete('/api/uploads/:id', adminAuth, (req, res, next) => {
     let moved;
     let original;
     try {
@@ -318,8 +378,12 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
       res.json({ success: true });
     } catch (error) { next(error); }
   });
-  app.get('/admin', (_req, res) => res.sendFile(path.join(ROOT, 'public', 'admin.html')));
-  app.use(express.static(path.join(ROOT, 'public'), { index: false, dotfiles: 'deny' }));
+  app.get('/admin', (_req, res) => {
+    const adminPage = path.join(PUBLIC_DIR, 'admin.html');
+    if (fs.existsSync(adminPage)) return res.sendFile(adminPage);
+    res.status(404).send('Admin page not supplied. Add public/admin.html.');
+  });
+  app.use(express.static(PUBLIC_DIR, { index: false, dotfiles: 'deny' }));
   app.use((_req, _res, next) => next(new HttpError(404, 'Not found.')));
   app.use((error, _req, res, _next) => {
     if (res.headersSent) return res.destroy();
@@ -329,7 +393,7 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
       : status === 404 ? 'File is no longer available.' : status < 500 ? 'Invalid request.' : 'Unable to complete the request.';
     if (error instanceof multer.MulterError) {
       status = error.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
-      message = error.code === 'LIMIT_FILE_SIZE' ? 'File exceeds the upload size limit.'
+      message = error.code === 'LIMIT_FILE_SIZE' ? 'File must be smaller than 10 MB.'
         : 'Invalid multipart fields. Use one file and only the supported device fields.';
     } else if (['Multipart: Boundary not found', 'Malformed part header', 'Unexpected end of form', 'Unexpected end of file'].includes(error.message)) {
       status = 400; message = 'Invalid multipart upload.';
@@ -339,24 +403,41 @@ function createApp({ dataDir = ROOT, log = console.error } = {}) {
   });
   return { app, db, dataDir, uploadDir, close: () => db.close() };
 }
-
-if (require.main === module) {
-  try {
-    const service = createApp();
-    const server = service.app.listen(8000, '127.0.0.1', () => {
-      console.log('PDF server: http://127.0.0.1:8000/  Admin: http://127.0.0.1:8000/admin');
-    });
-    // Node handles CONNECT outside the Express request pipeline.
-    server.on('connect', (req, socket) => {
-      logIncomingRequest(req);
-      socket.destroy();
-    });
-    server.on('error', error => { console.error('Server startup failed:', error.message); service.close(); process.exitCode = 1; });
-    for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => {
-      server.close(() => { service.close(); });
-      server.closeIdleConnections();
-    });
-  } catch (error) { console.error('Server startup failed:', error.message); process.exitCode = 1; }
+function startServer() {
+  const host = getListenHost();
+  const port = getListenPort();
+  const service = createApp({ localOnly: host === '127.0.0.1' || host === 'localhost' });
+  const server = service.app.listen(port, host, () => {
+    const address = server.address();
+    const shownHost = host === '0.0.0.0' ? 'localhost' : host;
+    console.log(`PDF server listening on ${host}:${address.port}`);
+    console.log(`Local URL: http://${shownHost}:${address.port}/`);
+    if (host === '0.0.0.0' && !process.env.ADMIN_TOKEN) {
+      console.warn('WARNING: ADMIN_TOKEN is unset. Public users may change or delete stored files.');
+    }
+    if (host === '0.0.0.0' && !process.env.UPLOAD_TOKEN) {
+      console.warn('WARNING: UPLOAD_TOKEN is unset. Anyone can send uploads to /create.');
+    }
+  });
+  // Refuse CONNECT proxy tunnels, like the original local server.
+  server.on('connect', (req, socket) => {
+    logIncomingRequest(req);
+    socket.destroy();
+  });
+  server.on('error', error => {
+    console.error('Server startup failed:', error.message);
+    service.close();
+    process.exitCode = 1;
+  });
+  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => {
+    server.close(() => service.close());
+    server.closeIdleConnections();
+  });
+  return { ...service, server };
 }
 
-module.exports = { createApp, TEXT_LIMIT, SETUP_LIMIT };
+if (require.main === module) {
+  try { startServer(); }
+  catch (error) { console.error('Server startup failed:', error.message); process.exitCode = 1; }
+}
+module.exports = { createApp, startServer, UPLOAD_LIMIT, TEXT_LIMIT, SETUP_LIMIT };

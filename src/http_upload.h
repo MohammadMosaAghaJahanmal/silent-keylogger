@@ -11,7 +11,8 @@ struct CountUploadSource {
     void* context;
     // Optional deterministic fixture for tests; normal uploads collect their own labels.
     const DeviceInfo* device = nullptr;
-    // The test harness selects an unused local port; PDF.exe always uses 8000.
+    // Local-only port: tests can override this; PDF.exe uses 8000 by default.
+    // Ignored when kUseHostedServer is enabled in http_upload.cpp (HTTPS/443).
     unsigned short port = 8000;
 };
 
