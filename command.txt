@@ -1,0 +1,1 @@
+.\build.ps1 -LlvmBin "C:\Users\JahanmalAgha\AppData\Local\Android\Sdk\ndk\30.0.16248370\toolchains\llvm\prebuilt\windows-x86_64\bin"
